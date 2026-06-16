@@ -1,38 +1,36 @@
-import express from "express";
+import express, { type ErrorRequestHandler } from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
-import multer from "multer";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
 import swaggerUi from "swagger-ui-express";
+import pinoHttp from "pino-http";
 import { faker } from "@faker-js/faker";
-import {
-  fakeAllowance,
-  fakeApproveTx,
-  fakeBalance,
-  fakeCandles,
-  fakeChainId,
-  type CandleInterval,
-  fakeDefiPositions,
-  fakeLendingHealth,
-  fakeOrder,
-  fakePool,
-  fakePortfolioPnl,
-  fakeSwapQuote,
-  fakeToken,
-  fakeTokenPrice,
-  fakeTxHash,
-  fakeUser
-} from "./fake.js";
-import { openApiSpec, openApiYaml } from "./openapi.js";
-import type { UserStatus } from "./fake.js";
+import { openApiYaml, specWithServer } from "./openapi.js";
+import { registerCoreRoutes } from "./routes/core.js";
+import { registerWeb3Routes } from "./routes/web3.js";
+import { config } from "./config.js";
+import { logger } from "./logger.js";
+import type { WsStats } from "./ws.js";
 
-export function createHttpApp() {
+export interface HttpAppOptions {
+  /** Live WebSocket stats for GET /api/metrics (zeros if omitted). */
+  wsStats?: () => WsStats;
+}
+
+export function createHttpApp(opts: HttpAppOptions = {}) {
   const app = express();
 
+  // Security headers. CSP is disabled so the bundled Swagger UI keeps working;
+  // a public deployment serving only the API can re-enable it.
+  app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors({ origin: true, credentials: true }));
   app.use(cookieParser());
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: true }));
 
+  // Assign a request id (honoring an inbound x-request-id) before logging so
+  // both the access log and error responses can correlate on it.
   app.use((req, res, next) => {
     const requestId = req.header("x-request-id") ?? faker.string.uuid();
     res.setHeader("x-request-id", requestId);
@@ -40,276 +38,73 @@ export function createHttpApp() {
     next();
   });
 
+  // Structured access logging — skipped under test to keep output clean.
+  if (config.NODE_ENV !== "test") {
+    app.use(
+      pinoHttp({
+        logger,
+        genReqId: (_req, res) =>
+          (res.locals as { requestId?: string }).requestId ?? faker.string.uuid(),
+        // Keep access logs at info even for 5xx — application errors are logged
+        // once, with a stack, by the error handler below (avoids double-logging).
+        customLogLevel: (_req, _res, err) => (err ? "error" : "info")
+      })
+    );
+  }
+
+  // Point Swagger UI / the YAML at the actual runtime port.
+  const baseUrl = `http://localhost:${config.PORT}`;
   app.get("/openapi.yaml", (_req, res) => {
-    res.type("text/yaml").send(openApiYaml());
+    res.type("text/yaml").send(openApiYaml(baseUrl));
   });
 
-  app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiSpec, { explorer: true }));
+  app.use("/docs", swaggerUi.serve, swaggerUi.setup(specWithServer(baseUrl), { explorer: true }));
 
-  app.get("/api/ping", (_req, res) => {
-    res.json({ ok: true, now: new Date().toISOString() });
-  });
+  // Optional rate limiting on the API surface (disabled by default; enable via
+  // RATE_LIMIT_MAX>0 for public deployments).
+  if (config.RATE_LIMIT_MAX > 0) {
+    app.use(
+      "/api",
+      rateLimit({
+        windowMs: config.RATE_LIMIT_WINDOW_MS,
+        limit: config.RATE_LIMIT_MAX,
+        standardHeaders: "draft-7",
+        legacyHeaders: false,
+        handler: (_req, res) => {
+          res.status(429).json({
+            error: "TooManyRequests",
+            message: "rate limit exceeded",
+            requestId: (res.locals as { requestId?: string }).requestId
+          });
+        }
+      })
+    );
+  }
 
-  app.post("/api/echo", (req, res) => {
-    res.json({
-      headers: req.headers,
-      query: req.query,
-      cookies: req.cookies,
-      body: req.body
-    });
-  });
-
-  app.get("/api/users", (req, res) => {
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 10) || 10, 1), 100);
-    const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
-
-    const items = Array.from({ length: limit }, () => fakeUser());
-    res.json({
-      items,
-      total: 1000,
-      limit,
-      offset
-    });
-  });
-
-  app.post("/api/users", (req, res) => {
-    const email = typeof req.body?.email === "string" ? req.body.email : undefined;
-    const name = typeof req.body?.name === "string" ? req.body.name : undefined;
-    res.status(201).json(fakeUser({ email, name }));
-  });
-
-  app.get("/api/users/:id", (req, res) => {
-    const traceId = req.header("x-trace-id") ?? null;
-    const session = (req.cookies?.session as string | undefined) ?? null;
-    res.json({
-      ...fakeUser({ id: req.params.id }),
-      debug: { traceId, session }
-    });
-  });
-
-  app.put("/api/users/:id", (req, res) => {
-    res.json(fakeUser({ id: req.params.id }));
-  });
-
-  app.patch("/api/users/:id", (req, res) => {
-    const status = typeof req.body?.status === "string" ? req.body.status : undefined;
-    const allowed: readonly UserStatus[] = ["active", "blocked", "pending"];
-    const parsedStatus =
-      status && allowed.includes(status as UserStatus) ? (status as UserStatus) : undefined;
-    res.json(fakeUser({ id: req.params.id, status: parsedStatus }));
-  });
-
-  app.delete("/api/users/:id", (_req, res) => {
-    res.status(204).send();
-  });
-
-  app.get("/api/orders", (req, res) => {
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 10) || 10, 1), 100);
-    const userId = typeof req.query.userId === "string" ? req.query.userId : undefined;
-    res.json(Array.from({ length: limit }, () => fakeOrder({ userId })));
-  });
-
-  app.post("/api/orders", (req, res) => {
-    const userId = typeof req.body?.userId === "string" ? req.body.userId : undefined;
-    const itemsCount = Number.isFinite(Number(req.body?.itemsCount))
-      ? Number(req.body.itemsCount)
-      : undefined;
-    res.status(201).json(fakeOrder({ userId, itemsCount }));
-  });
-
-  // ---- web3 / crypto / DeFi mock endpoints ----
-  app.get("/api/web3/tokens", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 20) || 20, 1), 200);
-    res.json({
-      chainId,
-      items: Array.from({ length: limit }, () => fakeToken({ chainId })),
-      ts: Date.now()
-    });
-  });
-
-  app.get("/api/web3/prices", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const addresses =
-      typeof req.query.addresses === "string"
-        ? req.query.addresses
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : [];
-    const items = (
-      addresses.length ? addresses : Array.from({ length: 5 }, () => fakeToken({ chainId }).address)
-    ).map((address) => fakeTokenPrice({ chainId, address }));
-    res.json({ chainId, items, ts: Date.now() });
-  });
-
-  app.get("/api/web3/wallets/:address/balances", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const address = req.params.address;
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 10) || 10, 1), 200);
-    res.json({
-      chainId,
-      address,
-      items: Array.from({ length: limit }, () => fakeBalance({ chainId, address })),
-      ts: Date.now()
-    });
-  });
-
-  app.get("/api/web3/defi/pools/:poolAddress", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    res.json(fakePool({ chainId, address: req.params.poolAddress }));
-  });
-
-  app.post("/api/web3/defi/swap/quote", (req, res) => {
-    const chainId = fakeChainId(req.body?.chainId);
-    const amountIn = typeof req.body?.amountIn === "string" ? req.body.amountIn : undefined;
-    const fromTokenAddress =
-      typeof req.body?.fromTokenAddress === "string" ? req.body.fromTokenAddress : undefined;
-    const toTokenAddress =
-      typeof req.body?.toTokenAddress === "string" ? req.body.toTokenAddress : undefined;
-
-    const fromToken = fakeToken({ chainId, address: fromTokenAddress });
-    const toToken = fakeToken({ chainId, address: toTokenAddress });
-    res.json(fakeSwapQuote({ chainId, fromToken, toToken, amountIn }));
-  });
-
-  app.get("/api/web3/allowance", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const owner = typeof req.query.owner === "string" ? req.query.owner : undefined;
-    const spender = typeof req.query.spender === "string" ? req.query.spender : undefined;
-    const tokenAddress =
-      typeof req.query.tokenAddress === "string" ? req.query.tokenAddress : undefined;
-    const token = fakeToken({ chainId, address: tokenAddress });
-    res.json(fakeAllowance({ chainId, owner, spender, token }));
-  });
-
-  app.post("/api/web3/approve", (req, res) => {
-    const chainId = fakeChainId(req.body?.chainId);
-    const owner = typeof req.body?.owner === "string" ? req.body.owner : undefined;
-    const spender = typeof req.body?.spender === "string" ? req.body.spender : undefined;
-    const tokenAddress =
-      typeof req.body?.tokenAddress === "string" ? req.body.tokenAddress : undefined;
-    const amount = typeof req.body?.amount === "string" ? req.body.amount : undefined;
-    const token = fakeToken({ chainId, address: tokenAddress });
-    res.json(fakeApproveTx({ chainId, owner, spender, token, amount }));
-  });
-
-  app.get("/api/web3/defi/positions", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const address = typeof req.query.address === "string" ? req.query.address : undefined;
-    res.json(fakeDefiPositions({ chainId, address }));
-  });
-
-  app.get("/api/web3/defi/lending/health", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const address = typeof req.query.address === "string" ? req.query.address : undefined;
-    const protocol = typeof req.query.protocol === "string" ? req.query.protocol : undefined;
-    res.json(fakeLendingHealth({ chainId, address, protocol }));
-  });
-
-  app.get("/api/web3/candles", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const baseToken = typeof req.query.baseToken === "string" ? req.query.baseToken : undefined;
-    const quoteToken = typeof req.query.quoteToken === "string" ? req.query.quoteToken : "USD";
-    const interval = (
-      typeof req.query.interval === "string" ? req.query.interval : "1m"
-    ) as CandleInterval;
-    const endTs = Number(req.query.endTs ?? Date.now()) || Date.now();
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 300) || 300, 1), 5000);
-    const startTs = Number(req.query.startTs ?? endTs - 60_000 * limit) || endTs - 60_000 * limit;
-
-    const basePriceUsd =
-      baseToken?.toUpperCase() === "WETH"
-        ? 3000
-        : baseToken?.toUpperCase() === "WBTC"
-          ? 100000
-          : undefined;
-    const candles = fakeCandles({ basePriceUsd, interval, startTs, endTs, limit });
-    res.json({ chainId, baseToken, quoteToken, interval, startTs, endTs, limit, items: candles });
-  });
-
-  app.get("/api/web3/portfolio/pnl", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const address = typeof req.query.address === "string" ? req.query.address : undefined;
-    const period = typeof req.query.period === "string" ? req.query.period : undefined;
-    const allowedPeriods = ["1d", "7d", "30d", "90d", "1y"] as const;
-    const parsedPeriod =
-      period && (allowedPeriods as readonly string[]).includes(period)
-        ? (period as (typeof allowedPeriods)[number])
-        : undefined;
-    res.json(fakePortfolioPnl({ chainId, address, period: parsedPeriod }));
-  });
-
-  app.post("/api/web3/tx/send", (req, res) => {
-    const chainId = fakeChainId(req.body?.chainId);
-    const from = typeof req.body?.from === "string" ? req.body.from : undefined;
-    const to = typeof req.body?.to === "string" ? req.body.to : undefined;
-    const value = typeof req.body?.value === "string" ? req.body.value : "0";
-    const data = typeof req.body?.data === "string" ? req.body.data : "0x";
-    res.status(201).json({
-      chainId,
-      hash: fakeTxHash(),
-      from,
-      to,
-      value,
-      data,
-      submittedAt: Date.now()
-    });
-  });
-
-  app.get("/api/web3/tx/:hash", (req, res) => {
-    const chainId = fakeChainId(req.query.chainId);
-    const confirmations = faker.number.int({ min: 0, max: 50 });
-    const status = faker.helpers.arrayElement(["pending", "confirmed", "failed"]);
-    res.json({
-      chainId,
-      hash: req.params.hash,
-      status,
-      confirmations,
-      blockNumber:
-        status === "pending" ? null : faker.number.int({ min: 10_000_000, max: 30_000_000 }),
-      gasUsed: status === "pending" ? null : faker.number.int({ min: 21_000, max: 1_500_000 }),
-      effectiveGasPriceGwei:
-        status === "pending" ? null : faker.number.float({ min: 0.1, max: 200, fractionDigits: 2 }),
-      ts: Date.now()
-    });
-  });
-
-  const upload = multer({ storage: multer.memoryStorage() });
-  app.post("/api/files/upload", upload.single("file"), (req, res) => {
-    if (!req.file) {
-      const requestId = (res.locals as { requestId?: string }).requestId;
-      res.status(400).json({
-        error: "BadRequest",
-        message: "file is required",
-        requestId
-      });
-      return;
-    }
-    res.json({
-      filename: req.file.originalname,
-      mimetype: req.file.mimetype,
-      size: req.file.size
-    });
-  });
-
-  app.get("/api/error", (_req, res) => {
-    const requestId = (res.locals as { requestId?: string }).requestId;
-    res.status(500).json({
-      error: "InternalError",
-      message: "Generated test error",
-      requestId
-    });
-  });
+  registerCoreRoutes(app, opts);
+  registerWeb3Routes(app);
 
   app.use((req, res) => {
-    const requestId = (res.locals as { requestId?: string }).requestId;
     res.status(404).json({
       error: "NotFound",
       message: `No route for ${req.method} ${req.path}`,
-      requestId
+      requestId: (res.locals as { requestId?: string }).requestId
     });
   });
+
+  // Centralized error handler: any thrown error / next(err) lands here in a
+  // single shape. Express 5 forwards async rejections automatically.
+  const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+    const requestId = (res.locals as { requestId?: string }).requestId;
+    logger.error({ err, requestId }, "Unhandled request error");
+    if (res.headersSent) return;
+    res.status(500).json({
+      error: "InternalError",
+      message: err instanceof Error ? err.message : "Internal Server Error",
+      requestId
+    });
+  };
+  app.use(errorHandler);
 
   return app;
 }

@@ -4,6 +4,10 @@ dist/
 # env
 .env
 .env.*
+!.env.example
+
+# coverage
+coverage/
 
 # logs
 logs/

@@ -1,6 +1,12 @@
-name: PR Checks
+name: CI Checks
 
 on:
+  push:
+    branches:
+      - development
+      - testing
+      - staging
+      - main
   pull_request:
     branches:
       - development
@@ -10,7 +16,7 @@ on:
 
 jobs:
   checks:
-    name: ✅ Checks (format/lint/build)
+    name: ✅ Checks (format/lint/build/test)
     runs-on: ubuntu-latest
 
     steps:
@@ -20,7 +26,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 22.13.0
+          node-version: 22.20.0
           cache: "npm"
 
       - name: Install Dependencies
@@ -34,3 +40,14 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: npm run coverage
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
