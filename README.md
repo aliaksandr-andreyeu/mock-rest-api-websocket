@@ -5,7 +5,7 @@ Service for testing API clients:
 - REST API (Express) with Swagger UI (OpenAPI).
 - Endpoints of all common types: GET/POST/PUT/PATCH/DELETE, query/path/header/cookie/body, upload.
 - Responses contain randomly generated mock data.
-- WebSocket server (`ws`) with `subscribe` by channel and random data pushed to the channel.
+- WebSocket server (`ws`) with `subscribe` by channel; one random event per subscribed channel is pushed each tick.
 
 ## Run
 
@@ -20,6 +20,54 @@ Defaults:
 - Swagger UI: `http://localhost:3000/docs`
 - OpenAPI YAML: `http://localhost:3000/openapi.yaml`
 - WebSocket: `ws://localhost:3000/ws`
+- Health probe: `http://localhost:3000/health`
+- Metrics: `http://localhost:3000/api/metrics`
+
+The OpenAPI document is generated from zod schemas (`src/schemas.ts`), which are
+also the source of the TypeScript types and are contract-tested against the data
+generators. Security headers (helmet) are on by default; rate limiting is
+opt-in via `RATE_LIMIT_MAX`.
+
+Requires Node.js >= 22.13.0.
+
+## Configuration
+
+Configuration is read from the environment (and a local `.env`) and validated at
+startup via `zod` — invalid values fail fast. Copy `.env.example` to `.env` to
+customize:
+
+| Variable                | Default       | Description                                        |
+| ----------------------- | ------------- | -------------------------------------------------- |
+| `PORT`                  | `3000`        | HTTP/WS port                                       |
+| `WS_TICK_MS`            | `1000`        | WebSocket push interval (ms, 50–60000)             |
+| `WS_HEARTBEAT_MS`       | `30000`       | Ping interval for dead-connection detection (ms)   |
+| `WS_MAX_PAYLOAD_BYTES`  | `65536`       | Reject inbound WS frames larger than this          |
+| `WS_MAX_BUFFERED_BYTES` | `1048576`     | Backpressure: skip events when send buffer is full |
+| `UPLOAD_MAX_BYTES`      | `5242880`     | Max accepted upload size (bytes)                   |
+| `RATE_LIMIT_WINDOW_MS`  | `60000`       | Rate-limit window for `/api` (ms)                  |
+| `RATE_LIMIT_MAX`        | `0`           | Max `/api` requests per window per IP (`0` = off)  |
+| `LOG_LEVEL`             | `info`        | pino level (`fatal`…`trace`, `silent`)             |
+| `NODE_ENV`              | `development` | `development` / `test` / `production`              |
+| `FAKER_SEED`            | _(unset)_     | Seed faker for reproducible mock data              |
+
+The server logs via `pino` and shuts down gracefully on `SIGTERM`/`SIGINT`.
+
+## Tests
+
+```bash
+npm test          # run the Vitest suite once
+npm run coverage  # with a coverage report
+```
+
+Covered: generator contracts, REST behavior (supertest), the WebSocket protocol,
+and an OpenAPI ↔ routes parity check that fails if the spec drifts from the code.
+
+## Docker
+
+```bash
+docker compose up --build
+# then: curl http://localhost:3000/health
+```
 
 ## Quick examples
 
@@ -59,6 +107,10 @@ curl "http://localhost:3000/api/web3/portfolio/pnl?chainId=1&address=0x111111111
 
 ### WebSocket
 
+Once subscribed, the server pushes one `event` per subscribed channel on every
+tick (`WS_TICK_MS`, default 1000ms). Per-channel cadence is constant and does not
+depend on how many channels you're subscribed to.
+
 Subscribe message:
 
 ```json
@@ -82,7 +134,7 @@ Server message format:
       "amount": 123.45,
       "ip": "1.2.3.4",
       "userAgent": "UA...",
-      "meta": ["a", "b"]
+      "meta": { "a": "x1y2z3a4", "b": "b1c2d3e4", "c": "c1d2e3f4" }
     }
   }
 }
@@ -127,3 +179,7 @@ When you unsubscribe, the server responds with:
 - `channels`: the **current** list of remaining subscriptions
 
 Use that to update your UI (e.g. remove the channel “chip” and re-render from `channels`).
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for release notes.

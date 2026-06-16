@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+.husky
+*.log
+logs
+.env
+.env.*
+coverage
+.DS_Store
+.idea
+.vscode
+SUMMARY.md
+SONNET-4.5.md
